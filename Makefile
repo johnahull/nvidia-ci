@@ -77,9 +77,13 @@ run-mig-tests: get-gpu-operator-must-gather get-nfd-must-gather
 	@echo "Executing mig-tests runner script"
 	scripts/mig-tests.sh $(ARGS)
 
-run-dra-native-tests: get-gpu-operator-must-gather get-nfd-must-gather ## Run the dra-native test suite (NVIDIADriver/GPUCluster, GPU Operator >= 26.7.0)
-	@echo "Executing dra-native test-runner script"
-	TEST_FEATURES=dra-native scripts/test-runner.sh $(ARGS)
+run-native-dra-tests: get-gpu-operator-must-gather get-nfd-must-gather ## Run the native DRA testcase (NVIDIADriver/GPUCluster, GPU Operator >= 26.7.0), part of the nvidiagpu suite
+	@echo "Executing native DRA test-runner script"
+	TEST_FEATURES=nvidiagpu TEST_LABELS=native-dra scripts/test-runner.sh $(ARGS)
+
+run-cleanup-tests: get-gpu-operator-must-gather get-nfd-must-gather ## Unconditionally remove NFD/GPU Operator/native-DRA resources left behind by a previous run with NVIDIAGPU_CLEANUP=false
+	@echo "Executing cleanup test-runner script"
+	TEST_FEATURES=nvidiagpu TEST_LABELS=cleanup scripts/test-runner.sh $(ARGS)
 
 test-bm-arm-deployment: ## Test bare-metal ARM deployment
 	/bin/bash tests/gpu-operator-arm-bm/uninstall-gpu-operator.sh

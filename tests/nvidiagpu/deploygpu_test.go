@@ -63,6 +63,14 @@ var (
 		"arm64": "quay.io/wabouham/gpu_burn_arm64:ubi9",
 	}
 
+	// commonNamespaceLabels are applied to every namespace this suite creates (GPU Operator,
+	// gpu-burn), to enable cluster monitoring and satisfy the Pod Security admission level
+	// required by privileged operand/workload pods.
+	commonNamespaceLabels = map[string]string{
+		"openshift.io/cluster-monitoring":    "true",
+		"pod-security.kubernetes.io/enforce": "privileged",
+	}
+
 	machineSetNamespace         = "openshift-machine-api"
 	replicas              int32 = 1
 	workerMachineSetLabel       = "machine.openshift.io/cluster-api-machine-role"
@@ -90,7 +98,24 @@ var (
 	CurrentCSVVersion          = ""
 	clusterArchitecture        = UndefinedValue
 	labelsToCheck              = []string{}
+
+	// nativeDRAInstallResult and nativeDRANVIDIADriverName are populated by the "native DRA"
+	// It below and consumed by cleanupNativeDRAResources in AfterAll; they stay nil/empty if
+	// that It never runs or is skipped before reaching the corresponding step.
+	nativeDRAInstallResult    *deploy.OLMInstallResult
+	nativeDRANVIDIADriverName = ""
+
+	// nativeDRAGPUClusterOwned records whether the "native DRA" It actually created the
+	// (singleton, fixed-name) GPUCluster resource, as opposed to finding one that already
+	// existed before this suite ran. cleanupNativeDRAResources only deletes GPUCluster when
+	// this is true, so a pre-existing GPUCluster left by something else is treated as setup
+	// state and never removed by this suite.
+	nativeDRAGPUClusterOwned = false
 )
+
+// nativeDRASmiExecTimeout bounds each 'nvidia-smi' pod-exec call in the native DRA It's
+// GPU-functionality validation step.
+const nativeDRASmiExecTimeout = 1 * time.Minute
 
 var _ = Describe("GPU", Ordered, Label(tsparams.LabelSuite), func() {
 
@@ -469,10 +494,7 @@ var _ = Describe("GPU", Ordered, Label(tsparams.LabelSuite), func() {
 				glog.V(gpuparams.GpuLogLevel).Infof("Labeling the newly created namespace '%s'",
 					nsBuilder.Object.Name)
 
-				labeledNsBuilder := createdNsBuilder.WithMultipleLabels(map[string]string{
-					"openshift.io/cluster-monitoring":    "true",
-					"pod-security.kubernetes.io/enforce": "privileged",
-				})
+				labeledNsBuilder := createdNsBuilder.WithMultipleLabels(commonNamespaceLabels)
 
 				newLabeledNsBuilder, err := labeledNsBuilder.Update()
 				Expect(err).ToNot(HaveOccurred(), "error labeling namespace %v :  %v ",
@@ -790,10 +812,7 @@ var _ = Describe("GPU", Ordered, Label(tsparams.LabelSuite), func() {
 				glog.V(gpuparams.GpuLogLevel).Infof("Labeling the newly created namespace '%s'",
 					createdGPUBurnNsBuilder.Object.Name)
 
-				labeledGPUBurnNsBuilder := createdGPUBurnNsBuilder.WithMultipleLabels(map[string]string{
-					"openshift.io/cluster-monitoring":    "true",
-					"pod-security.kubernetes.io/enforce": "privileged",
-				})
+				labeledGPUBurnNsBuilder := createdGPUBurnNsBuilder.WithMultipleLabels(commonNamespaceLabels)
 
 				newGPUBurnLabeledNsBuilder, err := labeledGPUBurnNsBuilder.Update()
 				Expect(err).ToNot(HaveOccurred(), "error labeling namespace %v :  %v ",
@@ -926,6 +945,136 @@ var _ = Describe("GPU", Ordered, Label(tsparams.LabelSuite), func() {
 			Expect(match1 && match2).ToNot(BeFalse(), "gpu-burn pod execution was FAILED")
 			glog.V(gpuparams.GpuLogLevel).Infof("Gpu-burn pod execution was successful")
 
+		})
+
+		// This It deploys the GPU Operator's native/CR-based DRA-enablement stack, introduced
+		// in GPU Operator 26.7.0: NVIDIADriver + GPUCluster, instead of ClusterPolicy. It is a
+		// self-contained alternative to the "Deploy NVIDIA GPU Operator with DTK" It above (the
+		// two are mutually exclusive ways of installing/configuring the same GPU Operator), and
+		// only runs when explicitly selected via the "native-dra" Ginkgo label, mirroring how
+		// "single-mig"/"mixed-mig" self-guard below.
+		It("Deploy NVIDIA GPU Operator with native DRA (NVIDIADriver/GPUCluster)", Label("native-dra"), func() {
+			if !mig.IsLabelInFilter("native-dra") {
+				glog.V(gpuparams.GpuLogLevel).Infof("Skipping test: 'native-dra' label not present in ginkgo label filter")
+				Skip("Test skipped: 'native-dra' label not present in ginkgo label filter")
+			}
+
+			By("Check if at least one worker node is GPU enabled")
+
+			gpuNodeFound, err := check.NodeWithLabel(inittools.APIClient, nvidiagpu.NvidiaGPULabel,
+				inittools.GeneralConfig.WorkerLabelMap)
+			Expect(err).ToNot(HaveOccurred(), "error checking for GPU labeled worker nodes: %v", err)
+
+			if !gpuNodeFound {
+				Skip("No GPU labeled worker nodes were found")
+			}
+
+			By("Resolve GPU Operator subscription channel")
+
+			nativeDRAChannel := SubscriptionChannel
+			if nativeDRAChannel == UndefinedValue {
+				pkgManifest, err := olm.PullPackageManifestByCatalog(inittools.APIClient, nvidiagpu.Package,
+					nvidiagpu.CatalogSourceNamespace, CatalogSource)
+				Expect(err).ToNot(HaveOccurred(), "error pulling GPU packagemanifest '%s' from catalog '%s': %v",
+					nvidiagpu.Package, CatalogSource, err)
+
+				nativeDRAChannel = pkgManifest.Object.Status.DefaultChannel
+			}
+
+			By("Deploy GPU Operator via OLM")
+
+			result, err := deploy.InstallOperatorFromCatalog(inittools.APIClient, gpuparams.GpuLogLevel, deploy.OLMInstallConfig{
+				Namespace:              nvidiagpu.NvidiaGPUNamespace,
+				NamespaceLabels:        commonNamespaceLabels,
+				OperatorGroupName:      nvidiagpu.OperatorGroupName,
+				SubscriptionName:       nvidiagpu.SubscriptionName,
+				PackageName:            nvidiagpu.Package,
+				CatalogSource:          CatalogSource,
+				CatalogSourceNamespace: nvidiagpu.CatalogSourceNamespace,
+				Channel:                nativeDRAChannel,
+				InstallPlanApproval:    InstallPlanApproval,
+				DeploymentName:         nvidiagpu.OperatorDeployment,
+			})
+			nativeDRAInstallResult = result
+			Expect(err).ToNot(HaveOccurred(), "error installing GPU Operator: %v", err)
+
+			By("Verify installed GPU Operator supports native DRA (GPUCluster CRD served)")
+
+			gpuClusterCRDServed, err := nvidiagpu.IsGPUClusterCRDServed(inittools.APIClient)
+			Expect(err).ToNot(HaveOccurred(), "error checking GPUCluster CRD availability: %v", err)
+
+			if !gpuClusterCRDServed {
+				Skip("Installed GPU Operator version does not serve the GPUCluster CRD " +
+					"(requires GPU Operator >= 26.7.0); skipping native DRA test")
+			}
+
+			By("Deploy minimal NVIDIADriver")
+
+			nvidiaDriverBuilder := nvidiagpu.NewNVIDIADriverBuilderFromObjectString(inittools.APIClient, result.AlmExamples)
+
+			// Label the object as owned by this testcase, so cleanup can later scope any
+			// list-based lookup (e.g. in a standalone cleanup run that doesn't have
+			// nativeDRANVIDIADriverName in memory) to resources this suite actually created,
+			// rather than matching a cluster's pre-existing native DRA installation.
+			if nvidiaDriverBuilder.Definition.Labels == nil {
+				nvidiaDriverBuilder.Definition.Labels = map[string]string{}
+			}
+			nvidiaDriverBuilder.Definition.Labels[nvidiagpu.NativeDRAOwnerLabelKey] = nvidiagpu.NativeDRAOwnerLabelValue
+
+			createdNVIDIADriverBuilder, err := nvidiaDriverBuilder.Create()
+			Expect(err).ToNot(HaveOccurred(), "error creating NVIDIADriver from alm-examples: %v", err)
+
+			nativeDRANVIDIADriverName = createdNVIDIADriverBuilder.Definition.Name
+
+			By("Wait for NVIDIADriver to be ready")
+
+			err = wait.NVIDIADriverReady(inittools.APIClient, nativeDRANVIDIADriverName,
+				nvidiagpu.ClusterPolicyReadyCheckInterval, nvidiagpu.ClusterPolicyReadyTimeout)
+			Expect(err).ToNot(HaveOccurred(), "error waiting for NVIDIADriver '%s' to be ready: %v",
+				nativeDRANVIDIADriverName, err)
+
+			By("Deploy minimal GPUCluster")
+
+			gpuClusterBuilder := nvidiagpu.NewGPUClusterBuilderFromObjectString(inittools.APIClient, result.AlmExamples)
+
+			// GPUCluster is a singleton with a fixed, well-known name: if one already exists,
+			// Create() is a no-op that returns success without creating anything. Check for
+			// pre-existence first so cleanup only ever removes a GPUCluster this It actually
+			// created, never one that was already there before this suite ran.
+			gpuClusterPreExisted := gpuClusterBuilder.Exists()
+
+			_, err = gpuClusterBuilder.Create()
+			Expect(err).ToNot(HaveOccurred(), "error creating GPUCluster from alm-examples: %v", err)
+
+			if !gpuClusterPreExisted {
+				nativeDRAGPUClusterOwned = true
+			}
+
+			By("Wait for GPUCluster to be ready")
+
+			err = wait.GPUClusterReady(inittools.APIClient, nvidiagpu.GPUClusterName,
+				nvidiagpu.ClusterPolicyReadyCheckInterval, nvidiagpu.ClusterPolicyReadyTimeout)
+			Expect(err).ToNot(HaveOccurred(), "error waiting for GPUCluster to be ready: %v", err)
+
+			By("Verify GPU functionality via nvidia-smi on driver pods")
+
+			driverPods, err := inittools.APIClient.Pods(nvidiagpu.NvidiaGPUNamespace).List(context.TODO(), metav1.ListOptions{
+				LabelSelector: "app.kubernetes.io/component=nvidia-driver",
+			})
+			Expect(err).ToNot(HaveOccurred(), "error listing NVIDIA driver pods: %v", err)
+			Expect(driverPods.Items).ToNot(BeEmpty(), "No NVIDIA driver pods found in namespace %s",
+				nvidiagpu.NvidiaGPUNamespace)
+
+			for _, driverPod := range driverPods.Items {
+				glog.V(gpuparams.GpuLogLevel).Infof("Executing nvidia-smi on driver pod %s", driverPod.Name)
+
+				output, err := mig.ExecCmdInPod(inittools.APIClient, driverPod.Name, nvidiagpu.NvidiaGPUNamespace,
+					[]string{"nvidia-smi"}, nativeDRASmiExecTimeout)
+				Expect(err).ToNot(HaveOccurred(), "error executing nvidia-smi on pod %s: %v", driverPod.Name, err)
+				Expect(output).ToNot(BeEmpty(), "nvidia-smi output is empty from pod %s", driverPod.Name)
+
+				glog.V(gpuparams.GpuLogLevel).Infof("nvidia-smi output from pod %s:\n%s", driverPod.Name, output)
+			}
 		})
 
 		It("Upgrade NVIDIA GPU Operator", Label("operator-upgrade"), func() {
@@ -1186,6 +1335,30 @@ var _ = Describe("GPU", Ordered, Label(tsparams.LabelSuite), func() {
 			}
 			mig.TestMixedMIGGPUWorkload(nvidiaGPUConfig, burn, BurnImageName, WorkerNodeSelector, cleanupAfterTest)
 		})
+
+		// This It performs no deployment of its own; it exists purely so that selecting the
+		// "cleanup" Ginkgo label causes this Describe's BeforeAll/AfterAll to run without
+		// having to re-run (and wait on) a full deploy It first. It is intended to be run on
+		// its own (e.g. via `make run-cleanup-tests`) after a previous run left resources in
+		// place with NVIDIAGPU_CLEANUP=false, to remove everything unconditionally: NFD, the
+		// GPU Operator (ClusterPolicy or NVIDIADriver/GPUCluster, whichever was deployed),
+		// its CSV/Subscription/OperatorGroup/Namespace, and any leftover gpu-burn resources.
+		It("Cleanup GPU Operator and native DRA resources", Label("cleanup"), func() {
+			if !mig.IsLabelInFilter("cleanup") {
+				glog.V(gpuparams.GpuLogLevel).Infof("Skipping test: 'cleanup' label not present in ginkgo label filter")
+				Skip("Test skipped: 'cleanup' label not present in ginkgo label filter")
+			}
+
+			By("Cleaning up NFD")
+
+			if err := nfd.Cleanup(inittools.APIClient); err != nil {
+				glog.Errorf("Error cleaning up NFD resources: %v", err)
+			}
+
+			By("Cleaning up GPU Operator and native DRA resources")
+
+			cleanupGPUOperatorResources()
+		})
 	})
 })
 
@@ -1193,6 +1366,7 @@ var _ = Describe("GPU", Ordered, Label(tsparams.LabelSuite), func() {
 // It checks if cleanup should run based on cleanupAfterTest and cleanup label
 func cleanupGPUOperatorResources() {
 	cleanupClusterPolicy()
+	cleanupNativeDRAResources()
 	cleanupCSV()
 	cleanupSubscription()
 	cleanupOperatorGroup()
@@ -1202,6 +1376,96 @@ func cleanupGPUOperatorResources() {
 	cleanupGPUBurnNamespace()
 
 	glog.V(gpuparams.GpuLogLevel).Infof("Completed cleanup of GPU Operator Resources")
+}
+
+// cleanupNativeDRAResources deletes the GPUCluster/NVIDIADriver created by the "native DRA"
+// It, if present; it is a no-op if that It never ran or never got that far. The CSV,
+// Subscription, OperatorGroup and Namespace created by that It are torn down by
+// cleanupCSV/cleanupSubscription/cleanupOperatorGroup/cleanupGPUOperatorNamespace above,
+// since those operate on the same names regardless of which CR flavor (ClusterPolicy vs
+// NVIDIADriver+GPUCluster) was deployed into them.
+func cleanupNativeDRAResources() {
+	// GPUCluster and NVIDIADriver both carry finalizers that only the GPU Operator's own
+	// controller (running inside nvidia-gpu-operator, which cleanupCSV/cleanupSubscription/
+	// cleanupGPUOperatorNamespace tear down right after this function returns) can clear. We
+	// must wait for both to actually be gone here, otherwise that controller can be killed
+	// before it clears the finalizer, permanently orphaning the object and leaving the
+	// namespace stuck Terminating.
+	const nativeDRADeleteTimeout = 3 * time.Minute
+
+	By("Deleting GPUCluster")
+
+	// Only delete GPUCluster if the "native DRA" It actually created it in this run. GPUCluster
+	// is a singleton with a fixed name, so simply finding one by that name doesn't mean this
+	// suite owns it: the native DRA It may have been skipped (e.g. no GPU node, or an operator
+	// version that doesn't serve the GPUCluster CRD) while a GPUCluster from unrelated setup
+	// state still exists. Deleting an unowned GPUCluster here would be a destructive surprise.
+	if !nativeDRAGPUClusterOwned {
+		glog.V(gpuparams.GpuLogLevel).Infof(
+			"GPUCluster was not created by this test run, skipping deletion")
+	} else if gpuClusterBuilder, err := nvidiagpu.PullGPUCluster(inittools.APIClient, nvidiagpu.GPUClusterName); err == nil {
+		if err := gpuClusterBuilder.DeleteAndWait(nativeDRADeleteTimeout); err != nil {
+			glog.Errorf("Error deleting GPUCluster: %v", err)
+		} else {
+			glog.V(gpuparams.GpuLogLevel).Infof("GPUCluster deleted successfully")
+		}
+	} else {
+		glog.V(gpuparams.GpuLogLevel).Infof("GPUCluster not found or already deleted")
+	}
+
+	By("Deleting NVIDIADriver")
+
+	if nativeDRANVIDIADriverName != "" {
+		// Same-process cleanup: this run's own "native DRA" It recorded exactly which
+		// NVIDIADriver it created, so delete only that one - no listing needed.
+		if nvidiaDriverBuilder, err := nvidiagpu.PullNVIDIADriver(inittools.APIClient, nativeDRANVIDIADriverName); err == nil {
+			if err := nvidiaDriverBuilder.DeleteAndWait(nativeDRADeleteTimeout); err != nil {
+				glog.Errorf("Error deleting NVIDIADriver %s: %v", nativeDRANVIDIADriverName, err)
+			} else {
+				glog.V(gpuparams.GpuLogLevel).Infof("NVIDIADriver %s deleted successfully", nativeDRANVIDIADriverName)
+			}
+		} else {
+			glog.V(gpuparams.GpuLogLevel).Infof("NVIDIADriver %s not found or already deleted", nativeDRANVIDIADriverName)
+		}
+
+		return
+	}
+
+	// Standalone cleanup run in a separate process (e.g. `make run-cleanup-tests`):
+	// nativeDRANVIDIADriverName is empty here since it never survives across process
+	// boundaries. Discover instances by the ownership label this suite applies to every
+	// NVIDIADriver it creates instead - never with an unfiltered, cluster-wide list, which
+	// would also match (and delete) a cluster's pre-existing native DRA installation that this
+	// suite never created (this cleanup runs after every GPU suite execution, including
+	// non-native-DRA ones).
+	nvidiaDrivers, err := nvidiagpu.ListNVIDIADriversByLabel(inittools.APIClient,
+		map[string]string{nvidiagpu.NativeDRAOwnerLabelKey: nvidiagpu.NativeDRAOwnerLabelValue})
+	if err != nil {
+		glog.Errorf("Error listing NVIDIADriver objects owned by this testcase: %v", err)
+
+		return
+	}
+
+	if len(nvidiaDrivers) == 0 {
+		glog.V(gpuparams.GpuLogLevel).Infof("NVIDIADriver not found or already deleted")
+
+		return
+	}
+
+	for _, nvidiaDriver := range nvidiaDrivers {
+		nvidiaDriverBuilder, err := nvidiagpu.PullNVIDIADriver(inittools.APIClient, nvidiaDriver.Name)
+		if err != nil {
+			glog.V(gpuparams.GpuLogLevel).Infof("NVIDIADriver %s not found or already deleted", nvidiaDriver.Name)
+
+			continue
+		}
+
+		if err := nvidiaDriverBuilder.DeleteAndWait(nativeDRADeleteTimeout); err != nil {
+			glog.Errorf("Error deleting NVIDIADriver %s: %v", nvidiaDriver.Name, err)
+		} else {
+			glog.V(gpuparams.GpuLogLevel).Infof("NVIDIADriver %s deleted successfully", nvidiaDriver.Name)
+		}
+	}
 }
 
 // cleanupClusterPolicy deletes the ClusterPolicy resource
